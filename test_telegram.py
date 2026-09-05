@@ -1,7 +1,7 @@
 import requests
 
-BOT_TOKEN = "8783269516:AAGunZPJbbZkliw4O6nkqCsPn0NwbHo5TfA"
-CHAT_ID = "5953882289"
+BOT_TOKEN = ""
+CHAT_ID = ""
 
 message = (
     "🚨 TEST ALERT 🚨\n\n"
