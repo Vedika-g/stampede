@@ -2,86 +2,129 @@ class StampedeRiskEngine:
 
     def __init__(self):
 
+        # ====================================================
+        # RISK WEIGHTS
+        # ====================================================
+
         self.people_weight = 0.30
         self.density_weight = 0.35
         self.movement_weight = 0.35
+
+        # ====================================================
+        # PERSISTENCE
+        # ====================================================
 
         self.high_risk_frames = 0
         self.warning_frames = 0
 
         self.previous_score = 0.0
 
+
     # ========================================================
     # PEOPLE SCORE
     # ========================================================
 
-    def people_score(self, count):
+    def people_score(
+        self,
+        count
+    ):
 
         if count < 20:
+
             return 0
 
         elif count < 50:
+
             return 30
 
         elif count < 100:
+
             return 60
 
         elif count < 150:
+
             return 80
 
         return 100
+
 
     # ========================================================
     # DENSITY SCORE
     # ========================================================
 
-    def density_score(self, count):
+    def density_score(
+        self,
+        count
+    ):
 
         if count < 20:
+
             return 0
 
         elif count < 50:
+
             return 30
 
         elif count < 100:
+
             return 60
 
         elif count < 150:
+
             return 80
 
         return 100
+
 
     # ========================================================
     # MOVEMENT SCORE
     # ========================================================
 
-    def movement_score(self, movement):
+    def movement_score(
+        self,
+        movement
+    ):
 
         if movement < 1.5:
+
             return 0
 
         elif movement < 2.5:
+
             return 30
 
         elif movement < 4.0:
+
             return 60
 
         elif movement < 6.0:
+
             return 80
 
         return 100
+
 
     # ========================================================
     # RISK CALCULATION
     # ========================================================
 
     def calculate_risk(
+
         self,
+
         people_count,
+
         csrnet_count,
+
         movement,
+
         sudden_movement=False
+
     ):
+
+        # ====================================================
+        # INDIVIDUAL SCORES
+        # ====================================================
 
         people = self.people_score(
             people_count
@@ -95,40 +138,51 @@ class StampedeRiskEngine:
             movement
         )
 
-        # ----------------------------------------------------
+
+        # ====================================================
         # BASE RISK
-        # ----------------------------------------------------
+        # ====================================================
 
         risk_score = (
 
-            people * self.people_weight
+            people
+            * self.people_weight
 
             +
 
-            density * self.density_weight
+            density
+            * self.density_weight
 
             +
 
-            movement_score * self.movement_weight
-
+            movement_score
+            * self.movement_weight
         )
 
-        # ----------------------------------------------------
+
+        # ====================================================
         # SUDDEN MOVEMENT BONUS
-        # ----------------------------------------------------
+        # ====================================================
 
         if sudden_movement:
 
             risk_score += 10
 
+
         risk_score = min(
+
             100,
-            round(risk_score, 2)
+
+            round(
+                risk_score,
+                2
+            )
         )
 
-        # ----------------------------------------------------
+
+        # ====================================================
         # RISK LEVEL
-        # ----------------------------------------------------
+        # ====================================================
 
         if risk_score < 40:
 
@@ -142,9 +196,10 @@ class StampedeRiskEngine:
 
             risk_level = "HIGH"
 
-        # ----------------------------------------------------
+
+        # ====================================================
         # HIGH-RISK PERSISTENCE
-        # ----------------------------------------------------
+        # ====================================================
 
         if risk_level == "HIGH":
 
@@ -154,21 +209,25 @@ class StampedeRiskEngine:
 
             self.high_risk_frames = 0
 
-        # ----------------------------------------------------
+
+        # ====================================================
         # WARNING
-        # ----------------------------------------------------
+        # ====================================================
 
         warning = (
+
             self.high_risk_frames >= 5
         )
 
-        # ----------------------------------------------------
+
+        # ====================================================
         # WARNING MESSAGE
-        # ----------------------------------------------------
+        # ====================================================
 
         if warning:
 
             warning_message = (
+
                 "Potential stampede detected. "
                 "Sustained high-risk crowd conditions."
             )
@@ -176,6 +235,7 @@ class StampedeRiskEngine:
         elif risk_level == "HIGH":
 
             warning_message = (
+
                 "High crowd risk detected. "
                 "Monitoring conditions."
             )
@@ -183,49 +243,73 @@ class StampedeRiskEngine:
         elif risk_level == "MEDIUM":
 
             warning_message = (
+
                 "Increasing crowd activity detected."
             )
 
         else:
 
             warning_message = (
+
                 "Crowd conditions normal."
             )
 
-        # ----------------------------------------------------
-        # PERSISTENCE
-        # ----------------------------------------------------
 
-        # Your YOLO runs every 3 frames.
-        # Assuming approximately 30 FPS video,
-        # each risk calculation represents ~0.1 sec.
+        # ====================================================
+        # PERSISTENCE
+        # ====================================================
+
+        # Risk calculations are performed every video frame.
+        #
+        # This value represents approximately 0.1 seconds
+        # per frame at 10 FPS.
+        #
+        # The actual warning condition remains based on
+        # 5 consecutive high-risk calculations.
 
         persistence = (
-            self.high_risk_frames * 0.1
+
+            self.high_risk_frames
+            * 0.1
         )
 
-        self.previous_score = risk_score
 
-        # ----------------------------------------------------
+        # ====================================================
+        # SAVE PREVIOUS SCORE
+        # ====================================================
+
+        self.previous_score = (
+            risk_score
+        )
+
+
+        # ====================================================
         # RETURN
-        # ----------------------------------------------------
+        # ====================================================
 
         return {
 
-            "people_score": people,
+            "people_score":
+                people,
 
-            "density_score": density,
+            "density_score":
+                density,
 
-            "movement_score": movement_score,
+            "movement_score":
+                movement_score,
 
-            "risk_score": risk_score,
+            "risk_score":
+                risk_score,
 
-            "risk_level": risk_level,
+            "risk_level":
+                risk_level,
 
-            "warning": warning,
+            "warning":
+                warning,
 
-            "warning_message": warning_message,
+            "warning_message":
+                warning_message,
 
-            "persistence": persistence
-
+            "persistence":
+                persistence
         }

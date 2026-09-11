@@ -2,6 +2,7 @@ import sys
 import os
 import time
 import requests
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 # ============================================================
@@ -14,38 +15,22 @@ ROOT_DIR = os.path.dirname(
     )
 )
 
-sys.path.insert(
-    0,
-    ROOT_DIR
-)
-
+sys.path.insert(0, ROOT_DIR)
 
 # ============================================================
 # IMPORTS
 # ============================================================
 
 import streamlit as st
-
 from ultralytics import YOLO
-
 import cv2
 import numpy as np
 import torch
 
-from PIL import Image
-
-from torchvision import transforms
-
 from huggingface_hub import hf_hub_download
 
 from csrnet.csrnet_model import CSRNet
-
 from risk_engine import StampedeRiskEngine
-
-
-# ============================================================
-# DASHBOARD UI
-# ============================================================
 
 from dashboard_ui import (
     apply_dashboard_style,
@@ -53,21 +38,18 @@ from dashboard_ui import (
     show_sidebar,
     show_section_title,
     create_video_placeholder,
-    create_metric_cards,
-    update_metrics,
     show_risk_status,
-    update_score_cards,
     show_risk_progress,
     create_history_container,
     update_history_chart,
     show_alert_panel,
     show_system_info,
-    show_footer
+    show_footer,
+    show_monitoring_status
 )
 
-
 # ============================================================
-# PAGE CONFIGURATION
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
@@ -77,9 +59,8 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-
 # ============================================================
-# APPLY UI
+# DASHBOARD STARTUP
 # ============================================================
 
 apply_dashboard_style()
@@ -88,10 +69,52 @@ show_header()
 
 input_mode, phone_url = show_sidebar()
 
+# ============================================================
+# PERFORMANCE CONFIGURATION
+# ============================================================
 
-# ============================================================
-# BACKEND CONFIGURATION
-# ============================================================
+# ------------------------------------------------------------
+# YOLOv8m
+# ------------------------------------------------------------
+# Increased image size and lower confidence improve detection
+# of smaller / partially occluded people.
+# ------------------------------------------------------------
+
+YOLO_INTERVAL = 2
+
+YOLO_IMGSZ = 768
+
+YOLO_CONF = 0.20
+
+# ------------------------------------------------------------
+# CSRNet
+# ------------------------------------------------------------
+
+CSRNET_INTERVAL = 20
+
+# ------------------------------------------------------------
+# Optical Flow
+# ------------------------------------------------------------
+
+FLOW_INTERVAL = 6
+
+# ------------------------------------------------------------
+# Display
+# ------------------------------------------------------------
+
+DISPLAY_WIDTH = 576
+
+DISPLAY_HEIGHT = 324
+
+# ------------------------------------------------------------
+# Streamlit UI
+# ------------------------------------------------------------
+
+UI_UPDATE_INTERVAL = 8
+
+# ------------------------------------------------------------
+# Backend
+# ------------------------------------------------------------
 
 API_URL = "http://127.0.0.1:8000/analysis"
 
@@ -101,8 +124,113 @@ backend_executor = ThreadPoolExecutor(
     max_workers=1
 )
 
-backend_task = None
+# ============================================================
+# CUDA CONFIGURATION
+# ============================================================
 
+USE_CUDA = torch.cuda.is_available()
+
+if USE_CUDA:
+
+    torch.backends.cudnn.benchmark = True
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    torch.backends.cudnn.allow_tf32 = True
+
+    torch.set_float32_matmul_precision("high")
+
+DEVICE = 0 if USE_CUDA else "cpu"
+
+HALF = True if USE_CUDA else False
+
+# ============================================================
+# MODEL LOADERS
+# ============================================================
+
+@st.cache_resource
+def load_yolo():
+
+    model_path = os.path.join(
+        ROOT_DIR,
+        "yolov8m.pt"
+    )
+
+    model = YOLO(model_path)
+
+    return model
+
+
+@st.cache_resource
+def load_csrnet():
+
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    weights_path = hf_hub_download(
+        repo_id="AbdurRahman011/csrnet-indian-metro-crowd-density",
+        filename="csrnet_v3_best.pth"
+    )
+
+    model = CSRNet()
+
+    checkpoint = torch.load(
+        weights_path,
+        map_location=device
+    )
+
+    if isinstance(checkpoint, dict):
+
+        if "state_dict" in checkpoint:
+
+            checkpoint = checkpoint["state_dict"]
+
+        elif "model_state_dict" in checkpoint:
+
+            checkpoint = checkpoint["model_state_dict"]
+
+    model.load_state_dict(
+        checkpoint,
+        strict=False
+    )
+
+    model.to(device)
+
+    model.eval()
+
+    return model, device
+
+
+# ============================================================
+# LOAD MODELS
+# ============================================================
+
+with st.spinner("Loading AI models..."):
+
+    yolo = load_yolo()
+
+    csrnet, csrnet_device = load_csrnet()
+
+# ============================================================
+# CSRNET NORMALIZATION
+# ============================================================
+
+CSR_MEAN = torch.tensor(
+    [0.485, 0.456, 0.406],
+    dtype=torch.float32
+).view(3, 1, 1)
+
+CSR_STD = torch.tensor(
+    [0.229, 0.224, 0.225],
+    dtype=torch.float32
+).view(3, 1, 1)
+
+# ============================================================
+# BACKEND FUNCTION
+# ============================================================
 
 def save_analysis_to_backend(
     camera_id,
@@ -115,7 +243,9 @@ def save_analysis_to_backend(
 
     data = {
 
-        "camera_id": str(camera_id),
+        "camera_id": str(
+            camera_id
+        ),
 
         "people_count": int(
             people_count
@@ -148,404 +278,223 @@ def save_analysis_to_backend(
 
     except Exception:
 
-        # Backend failure must never
-        # stop AI processing.
-
         pass
 
 
 # ============================================================
-# PERFORMANCE CONFIGURATION
-# ============================================================
-
-# DO NOT CHANGE
-
-YOLO_INTERVAL = 3
-
-YOLO_IMGSZ = 960
-
-YOLO_CONF = 0.30
-
-CSRNET_INTERVAL = 10
-
-FLOW_INTERVAL = 3
-
-DISPLAY_WIDTH = 640
-
-DISPLAY_HEIGHT = 360
-
-
-# ============================================================
-# CUDA
-# ============================================================
-
-USE_CUDA = torch.cuda.is_available()
-
-if USE_CUDA:
-
-    torch.backends.cudnn.benchmark = True
-
-
-DEVICE = (
-    0
-    if USE_CUDA
-    else "cpu"
-)
-
-HALF = (
-    True
-    if USE_CUDA
-    else False
-)
-
-
-# ============================================================
-# LOAD YOLO
-# ============================================================
-
-@st.cache_resource
-def load_yolo():
-
-    model_path = os.path.join(
-        ROOT_DIR,
-        "yolov8m.pt"
-    )
-
-    model = YOLO(
-        model_path
-    )
-
-    return model
-
-
-# ============================================================
-# LOAD CSRNET
-# ============================================================
-
-@st.cache_resource
-def load_csrnet():
-
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
-
-    weights_path = hf_hub_download(
-        repo_id=(
-            "AbdurRahman011/"
-            "csrnet-indian-metro-crowd-density"
-        ),
-        filename="csrnet_v3_best.pth"
-    )
-
-    model = CSRNet()
-
-    checkpoint = torch.load(
-        weights_path,
-        map_location=device
-    )
-
-    if isinstance(
-        checkpoint,
-        dict
-    ):
-
-        if "state_dict" in checkpoint:
-
-            checkpoint = (
-                checkpoint["state_dict"]
-            )
-
-        elif "model_state_dict" in checkpoint:
-
-            checkpoint = (
-                checkpoint["model_state_dict"]
-            )
-
-    model.load_state_dict(
-        checkpoint,
-        strict=False
-    )
-
-    model.to(device)
-
-    model.eval()
-
-    return model, device
-
-
-# ============================================================
-# LOAD MODELS
-# ============================================================
-
-with st.spinner(
-    "Loading AI models..."
-):
-
-    yolo = load_yolo()
-
-    csrnet, csrnet_device = load_csrnet()
-
-
-# ============================================================
-# CSRNET TRANSFORM
-# ============================================================
-
-transform = transforms.Compose([
-
-    transforms.ToTensor(),
-
-    transforms.Normalize(
-
-        mean=[
-            0.485,
-            0.456,
-            0.406
-        ],
-
-        std=[
-            0.229,
-            0.224,
-            0.225
-        ]
-    )
-])
-
-
-# ============================================================
-# MAIN MONITORING AREA
+# UI LAYOUT
 # ============================================================
 
 show_section_title(
     "🎥 Live Crowd Monitoring",
-    "AI-annotated video feed with person detection, "
-    "density heatmap and movement analysis"
+    "Real-time AI-powered crowd detection and stampede risk analysis"
 )
-
 
 video_display = create_video_placeholder()
 
-
-# ============================================================
-# MAIN METRICS
-# ============================================================
-
-st.markdown(
-    "### 📊 Real-Time Intelligence"
-)
-
-metric_columns = create_metric_cards()
-
+st.divider()
 
 # ============================================================
 # RISK STATUS
 # ============================================================
 
-st.markdown(
-    "### ⚠️ Crowd Safety Status"
-)
-
 risk_status_display = st.empty()
 
-
 # ============================================================
-# ANALYTICS AREA
+# ANALYTICS
 # ============================================================
 
-left_column, right_column = st.columns(
-    [2.2, 1],
-    gap="large"
-)
-
-
-with left_column:
-
-    show_section_title(
-        "📈 Live Risk Analytics",
-        "Recent crowd behaviour and AI risk trends"
-    )
-
-    history_placeholder = (
-        create_history_container()
-    )
-
-
-with right_column:
-
-    show_section_title(
-        "🚨 Alert Center",
-        "Current crowd safety condition"
-    )
-
-    alert_placeholder = st.empty()
-
-
-# ============================================================
-# RISK COMPONENTS
-# ============================================================
+st.divider()
 
 show_section_title(
-    "🧠 AI Risk Components",
-    "Individual factors contributing to the overall risk score"
+    "📈 Crowd Analytics",
+    "Continuous monitoring of crowd size, density, movement and risk"
 )
 
-score_columns = st.columns(3)
+history_placeholder = create_history_container()
 
+# ============================================================
+# ALERT CENTER
+# ============================================================
+
+st.divider()
+
+show_section_title(
+    "🚨 Alert Center",
+    "Current crowd safety status"
+)
+
+alert_placeholder = st.empty()
 
 # ============================================================
 # RISK PROGRESS
 # ============================================================
 
+st.divider()
+
 risk_progress_placeholder = st.empty()
 
+# ============================================================
+# SYSTEM STATUS
+# ============================================================
 
-# ============================================================
-# STATUS
-# ============================================================
+st.divider()
 
 status_display = st.empty()
 
-
 # ============================================================
-# START MONITORING
+# START BUTTON
 # ============================================================
 
-start_monitoring = st.sidebar.button(
-    "▶ Start Monitoring",
+st.divider()
+
+start_monitoring = st.button(
+    "▶️ START MONITORING",
     use_container_width=True
 )
 
+if not start_monitoring:
 
-if start_monitoring:
-
-    # ========================================================
-    # VIDEO SOURCE
-    # ========================================================
-
-    if input_mode == "Recorded Video":
-
-        video_source = os.path.join(
-            ROOT_DIR,
-            "crowd.mp4"
-        )
-
-        camera_id = "RECORDED_VIDEO"
-
-    else:
-
-        if not phone_url.strip():
-
-            st.error(
-                "❌ Enter your phone camera URL."
-            )
-
-            st.stop()
-
-        video_source = (
-            phone_url.strip()
-        )
-
-        camera_id = "PHONE_CAMERA"
-
-
-    # ========================================================
-    # OPEN VIDEO
-    # ========================================================
-
-    video = cv2.VideoCapture(
-        video_source
+    st.info(
+        "Click **START MONITORING** to begin AI crowd analysis."
     )
 
-    video.set(
-        cv2.CAP_PROP_BUFFERSIZE,
-        1
+    show_footer()
+
+    st.stop()
+
+# ============================================================
+# VIDEO SOURCE
+# ============================================================
+
+if input_mode == "Recorded Video":
+
+    video_source = os.path.join(
+        ROOT_DIR,
+        "people_walking.mp4"
     )
 
+    camera_id = "RECORDED_VIDEO"
 
-    if not video.isOpened():
+else:
+
+    if not phone_url.strip():
 
         st.error(
-            "❌ Could not open video source."
+            "❌ Enter your phone camera URL."
         )
 
         st.stop()
 
+    video_source = phone_url.strip()
 
-    status_display.success(
-        "✅ Video source connected. "
-        "AI monitoring started."
+    camera_id = "PHONE_CAMERA"
+
+# ============================================================
+# OPEN VIDEO
+# ============================================================
+
+video = cv2.VideoCapture(
+    video_source
+)
+
+video.set(
+    cv2.CAP_PROP_BUFFERSIZE,
+    1
+)
+
+if not video.isOpened():
+
+    st.error(
+        "❌ Could not open video source."
     )
 
+    st.stop()
 
-    # ========================================================
-    # VARIABLES
-    # ========================================================
+# ============================================================
+# STATE VARIABLES
+# ============================================================
 
-    frame_number = 0
+frame_number = 0
 
-    processed_yolo_frames = 0
+processed_yolo_frames = 0
 
-    processed_csrnet_frames = 0
+processed_csrnet_frames = 0
 
-    peak_people = 0
+processed_flow_frames = 0
 
-    last_people_count = 0
+peak_people = 0
 
-    last_boxes = []
+last_people_count = 0
 
-    last_density = 0.0
+last_boxes = []
 
-    last_heatmap = None
+last_density = 0.0
 
-    previous_gray = None
+last_heatmap = None
 
-    previous_movement = 0.0
+previous_gray = None
 
-    last_movement = 0.0
+previous_movement = 0.0
 
-    risk_engine = (
-        StampedeRiskEngine()
-    )
+last_movement = 0.0
 
-    start_time = time.time()
+risk_engine = StampedeRiskEngine()
 
-    last_backend_send = 0
+start_time = time.time()
 
-    backend_task = None
+last_backend_send = 0
 
-    history = []
+backend_task = None
 
+# ------------------------------------------------------------
+# History buffer
+# ------------------------------------------------------------
 
-    # ========================================================
-    # PROCESSING LOOP
-    # ========================================================
+history = deque(
+    maxlen=45
+)
+
+# ------------------------------------------------------------
+# Cached display
+# ------------------------------------------------------------
+
+last_display = None
+
+# ============================================================
+# MONITORING STATUS
+# ============================================================
+
+show_monitoring_status()
+
+# ============================================================
+# MAIN PROCESSING LOOP
+# ============================================================
+
+try:
 
     while True:
 
-        success, original_frame = (
-            video.read()
-        )
+        # ====================================================
+        # READ FRAME
+        # ====================================================
+
+        success, original_frame = video.read()
 
         if not success:
 
             break
 
-
         frame_number += 1
 
-
         # ====================================================
-        # YOLOv8m PERSON DETECTION
+        # YOLO PERSON DETECTION
+        # Every 2 frames
         # ====================================================
 
-        if (
-            frame_number
-            % YOLO_INTERVAL
-            == 0
-        ):
+        if frame_number % YOLO_INTERVAL == 0:
 
-            results = yolo.track(
+            results = yolo.predict(
 
                 original_frame,
 
@@ -559,43 +508,26 @@ if start_monitoring:
 
                 half=HALF,
 
-                persist=True,
-
-                tracker="bytetrack.yaml",
-
                 verbose=False
             )
-
 
             result = results[0]
 
             current_boxes = []
 
-
             if (
-
                 result.boxes is not None
-
-                and
-
-                len(result.boxes) > 0
-
+                and len(result.boxes) > 0
             ):
 
-                boxes = result.boxes
-
                 coordinates = (
-
-                    boxes.xyxy
+                    result
+                    .boxes
+                    .xyxy
                     .detach()
                     .cpu()
                     .numpy()
                 )
-
-
-                # =========================================
-                # FILTER SMALL DETECTIONS
-                # =========================================
 
                 for box in coordinates:
 
@@ -603,99 +535,69 @@ if start_monitoring:
                         box.astype(int)
                     )
 
-                    box_width = (
-                        x2 - x1
-                    )
+                    box_width = x2 - x1
 
-                    box_height = (
-                        y2 - y1
-                    )
+                    box_height = y2 - y1
 
+                    # ------------------------------------------------
+                    # Smaller boxes are now accepted.
+                    # This helps detect people farther away.
+                    # ------------------------------------------------
 
-                    if box_width < 10:
-
-                        continue
-
-
-                    if box_height < 20:
+                    if box_width < 6:
 
                         continue
 
+                    if box_height < 12:
+
+                        continue
 
                     current_boxes.append(
-                        box
+                        (
+                            x1,
+                            y1,
+                            x2,
+                            y2
+                        )
                     )
 
+            # ------------------------------------------------
+            # Update latest YOLO results
+            # ------------------------------------------------
 
-            last_boxes = (
+            last_boxes = current_boxes
+
+            last_people_count = len(
                 current_boxes
-            )
-
-            last_people_count = (
-                len(current_boxes)
             )
 
             processed_yolo_frames += 1
 
-
         # ====================================================
-        # PEOPLE COUNT
-        # ====================================================
-
-        people_count = (
-            last_people_count
-        )
-
-        peak_people = max(
-            peak_people,
-            people_count
-        )
-
-
-        # ====================================================
-        # DISPLAY FRAME
+        # CURRENT PEOPLE COUNT
         # ====================================================
 
-        frame = cv2.resize(
+        people_count = last_people_count
 
-            original_frame,
+        if people_count > peak_people:
 
-            (
-                DISPLAY_WIDTH,
-                DISPLAY_HEIGHT
-            ),
-
-            interpolation=cv2.INTER_AREA
-        )
-
-
-        height, width = (
-            frame.shape[:2]
-        )
-
+            peak_people = people_count
 
         # ====================================================
-        # CSRNET
+        # CSRNET DENSITY
+        # Every 20 frames
         # ====================================================
 
-        if (
-            frame_number
-            % CSRNET_INTERVAL
-            == 0
-        ):
+        if frame_number % CSRNET_INTERVAL == 0:
 
             csr_frame = cv2.resize(
 
                 original_frame,
 
-                (
-                    512,
-                    288
-                ),
+                (384, 216),
 
                 interpolation=cv2.INTER_AREA
             )
-
 
             rgb = cv2.cvtColor(
 
@@ -704,34 +606,47 @@ if start_monitoring:
                 cv2.COLOR_BGR2RGB
             )
 
+            # ------------------------------------------------
+            # NumPy → Torch
+            # ------------------------------------------------
 
-            image = Image.fromarray(
+            tensor = torch.from_numpy(
                 rgb
             )
 
+            tensor = (
+                tensor
+                .permute(
+                    2,
+                    0,
+                    1
+                )
+                .contiguous()
+                .float()
+            )
 
-            tensor = transform(
-                image
-            ).unsqueeze(0)
+            tensor.div_(255.0)
 
+            tensor.sub_(
+                CSR_MEAN
+            ).div_(
+                CSR_STD
+            )
+
+            tensor = tensor.unsqueeze(0)
 
             tensor = tensor.to(
-
                 csrnet_device,
-
                 non_blocking=True
             )
 
-
             with torch.inference_mode():
 
-                density_output = (
-                    csrnet(tensor)
+                density_output = csrnet(
+                    tensor
                 )
 
-
             density_map = (
-
                 density_output
                 .squeeze()
                 .detach()
@@ -739,35 +654,35 @@ if start_monitoring:
                 .numpy()
             )
 
+            # ------------------------------------------------
+            # Remove negative values
+            # ------------------------------------------------
 
-            density_map = np.maximum(
+            np.maximum(
                 density_map,
-                0
+                0,
+                out=density_map
             )
-
 
             last_density = float(
                 density_map.sum()
             )
 
-
             processed_csrnet_frames += 1
 
+            # =================================================
+            # CSRNET HEATMAP
+            # =================================================
 
-            # =============================================
-            # HEATMAP
-            # =============================================
-
-            min_value = (
+            density_min = float(
                 density_map.min()
             )
 
-            max_value = (
+            density_max = float(
                 density_map.max()
             )
 
-
-            if max_value > min_value:
+            if density_max > density_min:
 
                 normalized = cv2.normalize(
 
@@ -780,24 +695,16 @@ if start_monitoring:
                     255,
 
                     cv2.NORM_MINMAX
+                ).astype(
+                    np.uint8
                 )
 
             else:
 
-                normalized = (
-                    np.zeros_like(
-                        density_map,
-                        dtype=np.uint8
-                    )
+                normalized = np.zeros(
+                    density_map.shape,
+                    dtype=np.uint8
                 )
-
-
-            normalized = (
-                normalized.astype(
-                    np.uint8
-                )
-            )
-
 
             heatmap = cv2.applyColorMap(
 
@@ -805,7 +712,6 @@ if start_monitoring:
 
                 cv2.COLORMAP_JET
             )
-
 
             last_heatmap = cv2.resize(
 
@@ -819,135 +725,133 @@ if start_monitoring:
                 interpolation=cv2.INTER_LINEAR
             )
 
-
         # ====================================================
         # OPTICAL FLOW
+        # Every 6 frames
         # ====================================================
-
-        gray = cv2.cvtColor(
-
-            frame,
-
-            cv2.COLOR_BGR2GRAY
-        )
-
 
         sudden_movement = False
 
-
-        if previous_gray is None:
-
-            previous_gray = (
-                gray.copy()
-            )
-
-
-        elif (
-            frame_number
-            % FLOW_INTERVAL
-            == 0
+        if (
+            previous_gray is None
+            or frame_number % FLOW_INTERVAL == 0
         ):
 
-            flow = cv2.calcOpticalFlowFarneback(
+            flow_frame = cv2.resize(
 
-                previous_gray,
+                original_frame,
 
-                gray,
+                (320, 180),
 
-                None,
-
-                0.5,
-
-                2,
-
-                10,
-
-                2,
-
-                3,
-
-                1.1,
-
-                0
+                interpolation=cv2.INTER_AREA
             )
 
+            gray = cv2.cvtColor(
 
-            magnitude, angle = (
-                cv2.cartToPolar(
+                flow_frame,
+
+                cv2.COLOR_BGR2GRAY
+            )
+
+            if previous_gray is None:
+
+                previous_gray = gray
+
+            else:
+
+                flow = cv2.calcOpticalFlowFarneback(
+
+                    previous_gray,
+
+                    gray,
+
+                    None,
+
+                    0.5,
+
+                    2,
+
+                    10,
+
+                    2,
+
+                    3,
+
+                    1.1,
+
+                    0
+                )
+
+                # ------------------------------------------------
+                # Magnitude
+                # ------------------------------------------------
+
+                magnitude = cv2.magnitude(
 
                     flow[..., 0],
 
                     flow[..., 1]
                 )
-            )
 
+                current_movement = float(
+                    np.mean(magnitude)
+                )
 
-            current_movement = float(
-                np.mean(magnitude)
-            )
+                # ------------------------------------------------
+                # Sudden movement detection
+                # ------------------------------------------------
 
+                if (
+                    previous_movement > 0
+                    and
+                    current_movement
+                    >
+                    previous_movement * 1.5
+                ):
 
-            if (
+                    sudden_movement = True
 
-                previous_movement > 0
+                last_movement = (
+                    current_movement
+                )
 
-                and
+                previous_movement = (
+                    current_movement
+                )
 
-                current_movement
-                >
-                previous_movement * 1.5
+                previous_gray = gray
 
-            ):
-
-                sudden_movement = True
-
-
-            last_movement = (
-                current_movement
-            )
-
-            previous_movement = (
-                current_movement
-            )
-
-            previous_gray = (
-                gray.copy()
-            )
-
+                processed_flow_frames += 1
 
         # ====================================================
         # RISK ENGINE
         # ====================================================
 
-        risk = (
-            risk_engine.calculate_risk(
+        risk = risk_engine.calculate_risk(
 
-                people_count,
+            people_count,
 
-                last_density,
+            last_density,
 
-                last_movement,
+            last_movement,
 
-                sudden_movement
-            )
+            sudden_movement
         )
 
+        risk_score = risk[
+            "risk_score"
+        ]
 
-        risk_score = (
-            risk["risk_score"]
-        )
+        risk_level = risk[
+            "risk_level"
+        ]
 
-        risk_level = (
-            risk["risk_level"]
-        )
-
-        warning = (
-            risk["warning"]
-        )
-
+        warning = risk[
+            "warning"
+        ]
 
         # ====================================================
-        # SAVE HISTORY
+        # HISTORY
         # ====================================================
 
         history.append({
@@ -959,37 +863,25 @@ if start_monitoring:
             "movement": last_movement,
 
             "risk": risk_score
+
         })
 
-
-        if len(history) > 60:
-
-            history.pop(0)
-
-
         # ====================================================
-        # BACKEND
+        # BACKEND UPDATE
+        # Non-blocking
         # ====================================================
 
         current_time = time.time()
 
-
         if (
-
             current_time
             - last_backend_send
             >= API_SEND_INTERVAL
-
         ):
 
             if (
-
                 backend_task is None
-
-                or
-
-                backend_task.done()
-
+                or backend_task.done()
             ):
 
                 backend_task = (
@@ -1015,434 +907,369 @@ if start_monitoring:
                     current_time
                 )
 
-
         # ====================================================
-        # HEATMAP OVERLAY
+        # STREAMLIT UI UPDATE
         # ====================================================
 
-        if last_heatmap is not None:
+        if (
+            frame_number % UI_UPDATE_INTERVAL == 0
+            or frame_number == 1
+        ):
 
-            display = cv2.addWeighted(
+            # =================================================
+            # CREATE DISPLAY FRAME
+            # =================================================
 
-                frame,
+            frame = cv2.resize(
 
-                0.70,
+                original_frame,
 
-                last_heatmap,
+                (
+                    DISPLAY_WIDTH,
+                    DISPLAY_HEIGHT
+                ),
 
-                0.30,
-
-                0
+                interpolation=cv2.INTER_AREA
             )
-
-        else:
 
             display = frame.copy()
 
+            # =================================================
+            # HEATMAP OVERLAY
+            # =================================================
 
-        # ====================================================
-        # YOLO BOXES
-        # ====================================================
+            if last_heatmap is not None:
 
-        original_height, original_width = (
-            original_frame.shape[:2]
-        )
+                display = cv2.addWeighted(
 
+                    display,
 
-        scale_x = (
-            width /
-            original_width
-        )
+                    0.70,
 
-        scale_y = (
-            height /
-            original_height
-        )
+                    last_heatmap,
 
+                    0.30,
 
-        for box in last_boxes:
+                    0
+                )
 
-            x1, y1, x2, y2 = (
-                box.astype(int)
+            # =================================================
+            # DRAW YOLO BOXES
+            # =================================================
+
+            original_height, original_width = (
+                original_frame.shape[:2]
             )
 
-
-            x1 = int(
-                x1 * scale_x
+            scale_x = (
+                DISPLAY_WIDTH
+                / original_width
             )
 
-            x2 = int(
-                x2 * scale_x
+            scale_y = (
+                DISPLAY_HEIGHT
+                / original_height
             )
 
-            y1 = int(
-                y1 * scale_y
-            )
+            for box in last_boxes:
 
-            y2 = int(
-                y2 * scale_y
-            )
+                x1, y1, x2, y2 = box
 
+                x1 = int(
+                    x1 * scale_x
+                )
 
-            cv2.rectangle(
+                y1 = int(
+                    y1 * scale_y
+                )
+
+                x2 = int(
+                    x2 * scale_x
+                )
+
+                y2 = int(
+                    y2 * scale_y
+                )
+
+                cv2.rectangle(
+
+                    display,
+
+                    (x1, y1),
+
+                    (x2, y2),
+
+                    (0, 255, 0),
+
+                    2
+                )
+
+            # =================================================
+            # TEXT OVERLAY
+            # =================================================
+
+            cv2.putText(
 
                 display,
 
-                (x1, y1),
+                f"People: {people_count}",
 
-                (x2, y2),
+                (15, 30),
+
+                cv2.FONT_HERSHEY_SIMPLEX,
+
+                0.7,
 
                 (255, 255, 255),
 
                 2
             )
 
+            cv2.putText(
 
-        # ====================================================
-        # VIDEO OVERLAY
-        # ====================================================
+                display,
 
-        cv2.putText(
+                f"Density: {last_density:.1f}",
 
-            display,
+                (15, 60),
 
-            f"People: {people_count}",
+                cv2.FONT_HERSHEY_SIMPLEX,
 
-            (15, 30),
+                0.7,
 
-            cv2.FONT_HERSHEY_SIMPLEX,
+                (255, 255, 255),
 
-            0.65,
-
-            (0, 255, 0),
-
-            2
-        )
-
-
-        cv2.putText(
-
-            display,
-
-            f"Density: {last_density:.1f}",
-
-            (15, 60),
-
-            cv2.FONT_HERSHEY_SIMPLEX,
-
-            0.55,
-
-            (0, 255, 255),
-
-            2
-        )
-
-
-        cv2.putText(
-
-            display,
-
-            f"Movement: {last_movement:.2f}",
-
-            (15, 90),
-
-            cv2.FONT_HERSHEY_SIMPLEX,
-
-            0.55,
-
-            (255, 255, 255),
-
-            2
-        )
-
-
-        cv2.putText(
-
-            display,
-
-            f"Risk: {risk_score:.1f}/100",
-
-            (15, 120),
-
-            cv2.FONT_HERSHEY_SIMPLEX,
-
-            0.55,
-
-            (0, 165, 255),
-
-            2
-        )
-
-
-        if warning:
+                2
+            )
 
             cv2.putText(
 
                 display,
 
-                "!!! STAMPEDE WARNING !!!",
+                f"Movement: {last_movement:.2f}",
 
-                (
-                    max(
-                        width - 350,
-                        200
-                    ),
-                    35
-                ),
+                (15, 90),
 
                 cv2.FONT_HERSHEY_SIMPLEX,
 
-                0.65,
+                0.7,
 
-                (0, 0, 255),
+                (255, 255, 255),
 
                 2
             )
 
+            cv2.putText(
 
-        # ====================================================
-        # UPDATE MAIN METRICS
-        # ====================================================
+                display,
 
-        update_metrics(
+                f"Risk: {risk_score:.1f}",
 
-            metric_columns,
+                (15, 120),
 
-            people_count,
+                cv2.FONT_HERSHEY_SIMPLEX,
 
-            peak_people,
+                0.7,
 
-            last_density,
+                (255, 255, 255),
 
-            last_movement,
-
-            risk_score
-        )
-
-
-        # ====================================================
-        # UPDATE RISK STATUS
-        # ====================================================
-
-        show_risk_status(
-
-            risk_status_display,
-
-            risk_level,
-
-            risk_score,
-
-            warning
-        )
-
-
-        # ====================================================
-        # UPDATE ALERT CENTER
-        # ====================================================
-
-        show_alert_panel(
-
-            alert_placeholder,
-
-            risk_level,
-
-            risk_score,
-
-            warning
-        )
-
-
-        # ====================================================
-        # UPDATE RISK COMPONENTS
-        # ====================================================
-
-        update_score_cards(
-
-            score_columns,
-
-            risk
-        )
-
-
-        # ====================================================
-        # RISK PROGRESS
-        # ====================================================
-
-        with risk_progress_placeholder.container():
-
-            show_risk_progress(
-                risk_score
+                2
             )
 
+            # =================================================
+            # STAMPEDE WARNING OVERLAY
+            # =================================================
 
-        # ====================================================
-        # LIVE CHART
-        # ====================================================
+            if warning:
 
-        update_history_chart(
+                cv2.putText(
 
-            history_placeholder,
+                    display,
 
-            history
-        )
+                    "!!! STAMPEDE WARNING !!!",
 
+                    (15, 155),
 
-        # ====================================================
-        # STATUS
-        # ====================================================
+                    cv2.FONT_HERSHEY_SIMPLEX,
 
-        if warning:
+                    0.8,
 
-            status_display.error(
+                    (0, 0, 255),
 
-                "🚨 STAMPEDE WARNING — "
-                "Sustained high-risk conditions detected!"
+                    3
+                )
+
+            # =================================================
+            # CACHE DISPLAY
+            # =================================================
+
+            last_display = cv2.cvtColor(
+
+                display,
+
+                cv2.COLOR_BGR2RGB
             )
 
-        elif risk_level == "HIGH":
+            # =================================================
+            # RISK STATUS
+            # =================================================
 
-            status_display.warning(
+            show_risk_status(
 
-                "🔴 HIGH RISK — "
-                "Abnormal crowd conditions detected."
+                risk_status_display,
+
+                risk_level,
+
+                risk_score,
+
+                warning
             )
 
-        elif risk_level == "MEDIUM":
+            # =================================================
+            # ALERT CENTER
+            # =================================================
 
-            status_display.warning(
+            show_alert_panel(
 
-                "🟠 MEDIUM RISK — "
-                "Increased crowd activity detected."
+                alert_placeholder,
+
+                risk_level,
+
+                risk_score,
+
+                warning
             )
 
-        else:
+            # =================================================
+            # RISK PROGRESS
+            # =================================================
 
-            status_display.success(
+            with risk_progress_placeholder.container():
 
-                "🟢 LOW RISK — "
-                "Crowd conditions are currently stable."
+                show_risk_progress(
+                    risk_score
+                )
+
+            # =================================================
+            # HISTORY
+            # =================================================
+
+            update_history_chart(
+
+                history_placeholder,
+
+                list(history)
             )
 
+            # =================================================
+            # MONITORING STATUS
+            # =================================================
 
-        # ====================================================
-        # FPS
-        # ====================================================
+            if warning:
 
-        elapsed = (
-            time.time()
-            - start_time
-        )
+                status_display.error(
 
+                    "🚨 STAMPEDE WARNING — "
+                    "Potential stampede conditions detected."
+                )
 
-        fps = (
+            elif risk_level == "HIGH":
 
-            frame_number / elapsed
+                status_display.error(
 
-            if elapsed > 0
+                    "🔴 HIGH RISK — "
+                    "Immediate attention recommended."
+                )
 
-            else 0
-        )
+            elif risk_level == "MEDIUM":
 
+                status_display.warning(
 
-        # ====================================================
-        # SIDEBAR FPS
-        # ====================================================
+                    "🟠 MEDIUM RISK — "
+                    "Continue monitoring crowd conditions."
+                )
 
-        fps_placeholder = (
-            st.sidebar.empty()
-        )
+            else:
 
-        fps_placeholder.metric(
-            "Processing FPS",
-            f"{fps:.1f}"
-        )
+                status_display.success(
 
+                    "🟢 MONITORING ACTIVE — "
+                    "Crowd conditions currently stable."
+                )
 
-        # ====================================================
-        # DISPLAY VIDEO
-        # ====================================================
+            # =================================================
+            # VIDEO DISPLAY
+            # =================================================
 
-        rgb_display = cv2.cvtColor(
+            if last_display is not None:
 
-            display,
+                video_display.image(
 
-            cv2.COLOR_BGR2RGB
-        )
+                    last_display,
 
+                    channels="RGB",
 
-        video_display.image(
+                    use_container_width=True
+                )
 
-            rgb_display,
+# ============================================================
+# CLEANUP
+# ============================================================
 
-            channels="RGB",
-
-            use_container_width=True
-        )
-
-
-    # ========================================================
-    # CLEANUP
-    # ========================================================
+finally:
 
     video.release()
 
-
-    if torch.cuda.is_available():
-
-        torch.cuda.empty_cache()
-
-
-    # ========================================================
-    # FINAL STATISTICS
-    # ========================================================
-
-    elapsed = (
-        time.time()
-        - start_time
+    backend_executor.shutdown(
+        wait=False
     )
-
-
-    final_fps = (
-
-        frame_number / elapsed
-
-        if elapsed > 0
-
-        else 0
-    )
-
-
-    show_system_info(
-
-        camera_id,
-
-        final_fps,
-
-        processed_yolo_frames,
-
-        processed_csrnet_frames,
-
-        backend_status=True
-    )
-
-
-    st.success(
-
-        "✅ Processing completed successfully."
-    )
-
-
-    st.info(
-
-        f"Frames processed: {frame_number}  |  "
-        f"YOLO: {processed_yolo_frames}  |  "
-        f"CSRNet: {processed_csrnet_frames}  |  "
-        f"Peak crowd: {peak_people} people"
-    )
-
 
 # ============================================================
-# FOOTER
+# FINAL STATISTICS
 # ============================================================
+
+elapsed = (
+    time.time()
+    - start_time
+)
+
+final_fps = (
+
+    frame_number / elapsed
+
+    if elapsed > 0
+
+    else 0
+)
+
+# ============================================================
+# SYSTEM INFORMATION
+# ============================================================
+
+show_system_info(
+
+    camera_id,
+
+    final_fps,
+
+    processed_yolo_frames,
+
+    processed_csrnet_frames,
+
+    backend_status=True
+)
+
+st.success(
+    "✅ Processing completed successfully."
+)
+
+st.info(
+
+    f"Frames processed: {frame_number} | "
+    f"YOLO: {processed_yolo_frames} | "
+    f"CSRNet: {processed_csrnet_frames} | "
+    f"Optical Flow: {processed_flow_frames} | "
+    f"Peak crowd: {peak_people} people"
+)
 
 show_footer()
